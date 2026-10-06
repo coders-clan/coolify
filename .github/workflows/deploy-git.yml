@@ -1,0 +1,112 @@
+name: deploy-git
+
+on:
+  workflow_call:
+    inputs:
+      app-uuid:
+        description: 'Coolify application uuid. Empty falls back to the caller variable APP_UUID.'
+        type: string
+        required: false
+        default: ''
+      commit:
+        description: 'Full commit sha to build and deploy (rollback). Empty deploys the pushed commit, or the branch head on a manual run.'
+        type: string
+        required: false
+        default: ''
+      environment:
+        description: 'GitHub environment the job is bound to, so required reviewers can gate it.'
+        type: string
+        required: false
+        default: production
+      timeout-minutes:
+        description: 'Minutes to wait for the deployment to finish.'
+        type: number
+        required: false
+        default: 40
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: ${{ inputs.environment }}
+    concurrency:
+      group: deploy-git-${{ github.repository }}-${{ inputs.environment }}
+      cancel-in-progress: false
+    env:
+      COOLIFY_URL: ${{ secrets.COOLIFY_URL || vars.COOLIFY_URL }}
+      COOLIFY_TOKEN: ${{ secrets.COOLIFY_TOKEN }}
+      CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+      CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+      APP_UUID: ${{ inputs.app-uuid || vars.APP_UUID }}
+      REQUESTED_COMMIT: ${{ inputs.commit }}
+      PUSHED_COMMIT: ${{ github.sha }}
+      EVENT_NAME: ${{ github.event_name }}
+      WAIT_MINUTES: ${{ inputs.timeout-minutes }}
+    steps:
+      - name: Pin commit in Coolify and deploy
+        run: |
+          set -euo pipefail
+          for name in COOLIFY_URL COOLIFY_TOKEN CF_ACCESS_CLIENT_ID CF_ACCESS_CLIENT_SECRET APP_UUID; do
+            if [ -z "${!name}" ]; then
+              echo "missing configuration: $name" >&2
+              exit 1
+            fi
+          done
+          if [ "$EVENT_NAME" = push ] && [ -z "$REQUESTED_COMMIT" ]; then
+            commit="$PUSHED_COMMIT"
+          elif [ -n "$REQUESTED_COMMIT" ]; then
+            commit="$REQUESTED_COMMIT"
+          else
+            commit=HEAD
+          fi
+          if ! [[ "$commit" =~ ^([0-9a-f]{40}|HEAD)$ ]]; then
+            echo 'commit must be a full 40 character sha' >&2
+            exit 1
+          fi
+          api="${COOLIFY_URL%/}/api/v1"
+
+          call() {
+            local body code
+            body="$(mktemp)"
+            code="$(curl --silent --show-error --max-time 60 --output "$body" --write-out '%{http_code}' \
+              -H "CF-Access-Client-Id: ${CF_ACCESS_CLIENT_ID}" \
+              -H "CF-Access-Client-Secret: ${CF_ACCESS_CLIENT_SECRET}" \
+              -H "Authorization: Bearer ${COOLIFY_TOKEN}" \
+              -H 'Accept: application/json' \
+              "$@")" || { rm -f "$body"; return 1; }
+            if [[ "$code" != 2* ]]; then
+              echo "Coolify API answered HTTP $code: $(jq -r '.message // empty' "$body" 2>/dev/null | head -c 300)" >&2
+              rm -f "$body"
+              return 1
+            fi
+            cat "$body"
+            rm -f "$body"
+          }
+
+          call -X PATCH "$api/applications/${APP_UUID}" \
+            -H 'Content-Type: application/json' \
+            --data "$(jq -cn --arg sha "$commit" '{git_commit_sha: $sha}')" > /dev/null
+
+          response="$(call -X POST "$api/deploy?uuid=${APP_UUID}")"
+          deployment="$(jq -r '(.deployments // .)[0].deployment_uuid // empty' <<< "$response")"
+          if [ -z "$deployment" ]; then
+            echo 'deploy call returned no deployment_uuid' >&2
+            exit 1
+          fi
+          echo "deployment $deployment queued at $commit"
+
+          attempts=$((WAIT_MINUTES * 6))
+          for attempt in $(seq 1 "$attempts"); do
+            sleep 10
+            status="$(call "$api/deployments/${deployment}" | jq -r '.status // empty')"
+            echo "attempt $attempt: $status"
+            case "$status" in
+              finished) exit 0 ;;
+              failed | cancelled*) echo "deployment ended as $status" >&2; exit 1 ;;
+            esac
+          done
+          echo "deployment did not finish in ${WAIT_MINUTES} minutes" >&2
+          exit 1
