@@ -29,7 +29,9 @@ jobs:
     secrets: inherit
 ```
 
-Needs in the caller repo or the organisation: secrets `COOLIFY_TOKEN` (Read, Write, Deploy), `CF_ACCESS_CLIENT_ID`, `CF_ACCESS_CLIENT_SECRET`, `COOLIFY_URL` (secret or variable), and the variable `APP_UUID` (or pass `app-uuid`).
+Set the secrets once at organisation level (Settings, Secrets and variables, Actions, visibility All repositories) and every repo in coders-clan gets them without any setup. A new app repo then only needs the caller file above and the variable `APP_UUID`.
+
+The secrets and variables read: secrets `COOLIFY_TOKEN` (Read, Write, Deploy), `CF_ACCESS_CLIENT_ID`, `CF_ACCESS_CLIENT_SECRET`, `COOLIFY_URL` (secret or variable), and the variable `APP_UUID` (or pass `app-uuid`).
 
 Inputs: `app-uuid`, `commit`, `environment` (default `production`), `timeout-minutes` (default 40).
 
